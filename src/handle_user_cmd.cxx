@@ -112,6 +112,10 @@ ptr< cmd_result< ptr<buffer> > > raft_server::append_entries_ext
 
 ptr< cmd_result< ptr<buffer> > > raft_server::flip_learner_flag(int32 srv_id, bool to)
 {
+    // Under `lock_`, as `add_srv` and `remove_srv` run (`process_req`):
+    // `config_changing_`, `uncommitted_config_`, the log store and the peers
+    // are also used by the response handlers, which hold it.
+    recur_lock(lock_);
     ptr<cmd_result<ptr<buffer>>> ret = cs_new<cmd_result<ptr<buffer>>>(nullptr);
     if (role_ != srv_role::leader || write_paused_) {
         p_er("this is not a leader, cannot handle flip_learner_flag");
