@@ -505,7 +505,12 @@ void raft_server::shutdown() {
 
     // Cancel all scheduler tasks.
     // TODO: how do we guarantee all tasks are done?
-    cancel_schedulers();
+    // Under `lock_`, as the destructor does: the commit thread is still
+    // running here, and it reads `scheduler_` and `election_task_` under
+    // `lock_` (`reconfigure` -> `restart_election_timer`).
+    {   recur_lock(lock_);
+        cancel_schedulers();
+    }
 
     p_in("cancelled all schedulers.");
 
