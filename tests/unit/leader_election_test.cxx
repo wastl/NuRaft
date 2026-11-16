@@ -859,6 +859,88 @@ int leadership_takeover_offline_candidate_test() {
     return 0;
 }
 
+int late_prevote_response_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Yield leadership to S2.
+    s1.dbgLog(" --- yield leadership ---");
+    s1.raftServer->yield_leadership(false, 2);
+    // Send heartbeat.
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s1.fNet->execReqResp();
+    // After getting response of heartbeat, S1 will resign.
+    s1.fNet->execReqResp();
+    CHK_FALSE( s1.raftServer->is_leader() );
+
+    // Now S2 should have received takeover request, and sent
+    // vote requests to S1 and S3.
+    CHK_EQ( 1, s2.fNet->getNumPendingReqs(s1_addr) );
+    CHK_EQ( 1, s2.fNet->getNumPendingReqs(s3_addr) );
+    uint64_t vote_term = s2.raftServer->get_term();
+
+    // The vote request to S1 fails.
+    s2.fNet->makeReqFail(s1_addr);
+
+    // The election timer of S2 fires while the vote request to S3 is
+    // still in flight. S2 starts a pre-vote of the same term. Only S1
+    // receives it, as the connection to S3 is busy.
+    s2.dbgLog(" --- invoke election timer of S2 ---");
+    s2.fTimer->invoke( timer_task_type::election_timer );
+    CHK_EQ( vote_term, s2.raftServer->get_term() );
+    CHK_EQ( 1, s2.fNet->getNumPendingReqs(s1_addr) );
+
+    // S1 grants the pre-vote, but the response is delayed.
+    s2.fNet->delieverReqTo(s1_addr);
+
+    // S3 grants the vote, S2 becomes the leader.
+    s2.fNet->execReqResp(s3_addr);
+    CHK_TRUE( s2.raftServer->is_leader() );
+    CHK_EQ( vote_term, s2.raftServer->get_term() );
+
+    // Now the pre-vote response from S1 arrives. It should be ignored:
+    // S2 should stay the leader, without starting a new election.
+    s2.fNet->handleRespFrom(s1_addr);
+    CHK_TRUE( s2.raftServer->is_leader() );
+    CHK_EQ( vote_term, s2.raftServer->get_term() );
+
+    // Send new config as a new leader.
+    s2.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s2.fNet->execReqResp();
+    // Follow-up: commit.
+    s2.fNet->execReqResp();
+    s2.fNet->execReqResp();
+    // Wait for bg commit for configuration change.
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    CHK_FALSE( s1.raftServer->is_leader() );
+    CHK_TRUE( s2.raftServer->is_leader() );
+    CHK_FALSE( s3.raftServer->is_leader() );
+    CHK_EQ( vote_term, s2.raftServer->get_term() );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int temporary_leader_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -1022,6 +1104,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "leadership takeover with offline candidate test",
                leadership_takeover_offline_candidate_test );
+
+    ts.doTest( "late pre-vote response test",
+               late_prevote_response_test );
 
     ts.doTest( "temporary leader test",
                temporary_leader_test );

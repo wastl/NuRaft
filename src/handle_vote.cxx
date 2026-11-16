@@ -505,6 +505,21 @@ ptr<resp_msg> raft_server::handle_prevote_req(req_msg& req) {
 }
 
 void raft_server::handle_prevote_resp(resp_msg& resp) {
+    if (role_ != srv_role::candidate) {
+        // A pre-vote round counts only while this node is a candidate.
+        // A candidate whose election timer fires while its vote requests
+        // are still in flight starts a new pre-vote round with the same
+        // term. If it wins the election (or follows a new leader) before
+        // the responses of that round arrive, they still match
+        // `pre_vote_.term_`, and a quorum of them would make the node
+        // start a new election right after it became the leader.
+        p_in("[PRE-VOTE RESP] from peer %d, resp term %" PRIu64 ", "
+             "my role %s, not a candidate anymore. ignore it.",
+             resp.get_src(), resp.get_term(),
+             srv_role_to_string(role_).c_str());
+        return;
+    }
+
     if (resp.get_term() != pre_vote_.term_) {
         // Vote response for other term. Should ignore it.
         p_in("[PRE-VOTE RESP] from peer %d, my role %s, "
