@@ -220,8 +220,14 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms) {
     }
 
     ptr<cluster_config> cur_config = get_config();
-    bool need_to_handle_commit_elem = ( is_leader() &&
-                                        !cur_config->is_async_replication() );
+    // NOTE:
+    //   Whether this node is the leader should be checked for each log
+    //   entry, not once for the whole loop. A loop that began while this
+    //   node was a follower (e.g., applying a backlog) may continue after
+    //   it became the leader, and then it applies the new leader's own
+    //   log entries. Their client requests should be notified, otherwise
+    //   they wait until `client_req_timeout_`.
+    bool sync_replication = !cur_config->is_async_replication();
 
     bool first_loop_exec = true;
     bool finished_in_time = true;
@@ -268,7 +274,7 @@ bool raft_server::commit_in_bg_exec(size_t timeout_ms) {
         }
 
         if (le->get_val_type() == log_val_type::app_log) {
-            commit_app_log(index_to_commit, le, need_to_handle_commit_elem);
+            commit_app_log(index_to_commit, le, sync_replication && is_leader());
 
         } else if (le->get_val_type() == log_val_type::conf) {
             commit_conf(index_to_commit, le);

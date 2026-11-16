@@ -24,6 +24,9 @@ limitations under the License.
 #include "raft_params.hxx"
 #include "test_common.h"
 
+#include <condition_variable>
+#include <mutex>
+
 #include <stdio.h>
 
 using namespace nuraft;
@@ -1577,6 +1580,158 @@ int async_append_handler_cancel_test() {
     return 0;
 }
 
+// State machine that blocks the commit of the given log index
+// until `release()` is called.
+class CommitBlockingSm : public TestSm {
+public:
+    CommitBlockingSm(SimpleLogger* logger)
+        : TestSm(logger)
+        , blockIdx(0)
+        , entered(false)
+        , released(false)
+        {}
+
+    ptr<buffer> commit(const ulong log_idx, buffer& data) override {
+        if (log_idx == blockIdx) {
+            std::unique_lock<std::mutex> l(lock);
+            entered = true;
+            cv.notify_all();
+            cv.wait(l, [this]() { return released; });
+        }
+        return TestSm::commit(log_idx, data);
+    }
+
+    void setBlockIdx(ulong idx) { blockIdx = idx; }
+
+    bool waitEntered(size_t timeout_ms) {
+        std::unique_lock<std::mutex> l(lock);
+        return cv.wait_for( l, std::chrono::milliseconds(timeout_ms),
+                            [this]() { return entered; } );
+    }
+
+    void release() {
+        std::lock_guard<std::mutex> l(lock);
+        released = true;
+        cv.notify_all();
+    }
+
+private:
+    std::atomic<ulong> blockIdx;
+    std::mutex lock;
+    std::condition_variable cv;
+    bool entered;
+    bool released;
+};
+
+int new_leader_notifies_commit_while_applying_backlog_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+    std::vector<RaftPkg*> pkgs_s1_s3 = {&s1, &s3};
+
+    // S2's state machine can block the commit of a given log entry.
+    ptr<CommitBlockingSm> s2_sm;
+    CHK_Z( launch_servers( pkgs, nullptr, false, cb_default,
+                           [&](RaftPkg* pkg) {
+                               if (pkg->myId != 2) return;
+                               s2_sm = cs_new<CommitBlockingSm>
+                                       ( pkg->fBase->getLogger() );
+                               pkg->sm = s2_sm;
+                               pkg->ctx->state_machine_ = s2_sm;
+                           } ) );
+    CHK_Z( make_group( pkgs ) );
+
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        pp->raftServer->update_params(param);
+    }
+
+    // Make sure S2's commit thread is released even if the test fails.
+    TestSuite::GcFunc release_s2_sm([&]() { s2_sm->release(); });
+
+    // S2 will block the commit of the next log entry.
+    s2_sm->setBlockIdx( s1.raftServer->get_last_log_idx() + 1 );
+
+    // S1 appends a log entry.
+    {
+        std::string test_msg = "test_by_s1";
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        ptr<raft_result> ret = s1.raftServer->append_entries( {msg} );
+        CHK_TRUE( ret->get_accepted() );
+    }
+    // Packet for pre-commit.
+    s1.fNet->execReqResp();
+    // Packet for commit.
+    s1.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs_s1_s3, COMMIT_TIMEOUT_SEC) );
+
+    // S2's commit loop starts as a follower, and blocks in the middle.
+    CHK_TRUE( s2_sm->waitEntered(COMMIT_TIMEOUT_SEC * 1000) );
+
+    // Yield leadership to S2.
+    s1.dbgLog(" --- yield leadership ---");
+    s1.raftServer->yield_leadership(false, 2);
+    // Send heartbeat.
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s1.fNet->execReqResp();
+    // After getting response of heartbeat, S1 will resign.
+    s1.fNet->execReqResp();
+
+    // Now S2 should have received takeover request.
+    // Send vote requests.
+    s2.fNet->execReqResp();
+    CHK_TRUE( s2.raftServer->is_leader() );
+
+    // S2 appends a log entry as the new leader.
+    ptr<raft_result> ret;
+    {
+        std::string test_msg = "test_by_s2";
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        ret = s2.raftServer->append_entries( {msg} );
+        CHK_TRUE( ret->get_accepted() );
+    }
+    uint64_t s2_log_idx = s2.raftServer->get_last_log_idx();
+
+    // Replicate the new config and the new log entry, and commit them.
+    s2.fNet->execReqResp();
+    s2.fNet->execReqResp();
+    s2.fNet->execReqResp();
+    CHK_GTEQ( s2.raftServer->get_target_committed_log_idx(), s2_log_idx );
+    CHK_FALSE( ret->has_result() );
+
+    // Release S2's state machine. The commit loop that began as a
+    // follower applies the new log entry as well.
+    s2_sm->release();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // The client request to S2 should have got the result.
+    CHK_TRUE( ret->has_result() );
+    CHK_EQ( cmd_result_code::OK, ret->get_result_code() );
+    CHK_GT( s2.getTestSm()->isCommitted("test_by_s2"), 0 );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int apply_config_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -2251,6 +2406,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "async append handler cancel test",
                async_append_handler_cancel_test );
+
+    ts.doTest( "new leader notifies commit while applying backlog test",
+               new_leader_notifies_commit_while_applying_backlog_test );
 
     ts.doTest( "apply config log entry test",
                apply_config_test );
