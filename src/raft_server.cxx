@@ -1476,7 +1476,23 @@ void raft_server::yield_leadership(bool immediate_yield,
     }
 
     // Pause write.
-    write_paused_ = true;
+    //
+    // NOTE:
+    //   `handle_cli_req()` checks `write_paused_` and then appends
+    //   the log entry under `cli_lock_` (not `lock_`). If we set the flag
+    //   without `cli_lock_`, a client request that has passed the check
+    //   can append its log entry after the resignation condition (the
+    //   successor's matched index equals the last log index) has been
+    //   met. Then this node resigns with a log entry that the successor
+    //   does not have, and rejects the successor's vote request.
+    //
+    //   Acquiring `cli_lock_` here ensures that a request in progress
+    //   finishes appending first, and all later requests see the flag.
+    //   The lock order `lock_` -> `cli_lock_` is the same as in
+    //   `become_follower()`.
+    {   std::lock_guard<std::recursive_mutex> ll(cli_lock_);
+        write_paused_ = true;
+    }
     p_in(" --- WRITE PAUSED ---");
 
     if (candidate_id > -1) {

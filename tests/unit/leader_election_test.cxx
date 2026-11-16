@@ -24,6 +24,12 @@ limitations under the License.
 #include "raft_params.hxx"
 #include "test_common.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
+#include <thread>
+
 #include <stdio.h>
 
 using namespace nuraft;
@@ -859,6 +865,164 @@ int leadership_takeover_offline_candidate_test() {
     return 0;
 }
 
+// Log store that calls a hook at the beginning of `append()`,
+// before the log entry gets its index.
+class AppendHookLogStore : public inmem_log_store {
+public:
+    ulong append(ptr<log_entry>& entry) override {
+        std::function<void()> hook;
+        {   std::lock_guard<std::mutex> l(hookLock);
+            hook = std::move(beforeAppend);
+            beforeAppend = nullptr;
+        }
+        if (hook) hook();
+        return inmem_log_store::append(entry);
+    }
+
+    // The hook is called once, by the next `append()`.
+    void setBeforeAppend(std::function<void()> hook) {
+        std::lock_guard<std::mutex> l(hookLock);
+        beforeAppend = std::move(hook);
+    }
+
+private:
+    std::mutex hookLock;
+    std::function<void()> beforeAppend;
+};
+
+class AppendHookMgr : public TestMgr {
+public:
+    AppendHookMgr(int srv_id, const std::string& endpoint)
+        : TestMgr(srv_id, endpoint)
+        , hookStore( cs_new<AppendHookLogStore>() )
+        {}
+
+    ptr<log_store> load_log_store() override {
+        return hookStore;
+    }
+
+    ptr<AppendHookLogStore> hookStore;
+};
+
+int leadership_takeover_with_append_in_flight_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2};
+
+    // S1's log store can block an append.
+    ptr<AppendHookMgr> s1_mgr;
+    CHK_Z( launch_servers( pkgs, nullptr, false, cb_default,
+                           [&](RaftPkg* pkg) {
+                               if (pkg->myId != 1) return;
+                               s1_mgr = cs_new<AppendHookMgr>
+                                        ( pkg->myId, pkg->myEndpoint );
+                               pkg->sMgr = s1_mgr;
+                               pkg->ctx->state_mgr_ = s1_mgr;
+                           } ) );
+    CHK_Z( make_group( pkgs ) );
+
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.return_method_ = raft_params::async_handler;
+        pp->raftServer->update_params(param);
+    }
+
+    // The next append to S1 (by the client request below) blocks
+    // before its log entry gets an index, while holding `cli_lock_`.
+    // It is released when the wait times out.
+    const size_t APPEND_BLOCK_MS = 1000;
+    std::mutex hook_lock;
+    std::condition_variable hook_cv;
+    bool in_append = false;
+    bool append_released = false;
+    std::atomic<bool> append_resumed(false);
+    s1_mgr->hookStore->setBeforeAppend([&]() {
+        std::unique_lock<std::mutex> l(hook_lock);
+        in_append = true;
+        hook_cv.notify_all();
+        hook_cv.wait_for( l, std::chrono::milliseconds(APPEND_BLOCK_MS),
+                          [&]() { return append_released; } );
+        append_resumed = true;
+    });
+    auto release_append = [&]() {
+        std::lock_guard<std::mutex> l(hook_lock);
+        append_released = true;
+        hook_cv.notify_all();
+    };
+
+    std::string test_msg = "in_flight";
+    std::thread writer([&]() {
+        ptr<buffer> msg = buffer::alloc(test_msg.size() + 1);
+        msg->put(test_msg);
+        s1.raftServer->append_entries( {msg} );
+    });
+    TestSuite::GcFunc join_writer([&]() {
+        release_append();
+        if (writer.joinable()) writer.join();
+    });
+    {   std::unique_lock<std::mutex> l(hook_lock);
+        CHK_TRUE( hook_cv.wait_for( l, std::chrono::seconds(COMMIT_TIMEOUT_SEC),
+                                    [&]() { return in_append; } ) );
+    }
+
+    // Yield leadership to S2, while the append is in flight.
+    s1.dbgLog(" --- yield leadership ---");
+    std::thread yielder([&]() {
+        s1.raftServer->yield_leadership(false, 2);
+    });
+    yielder.join();
+
+    // If the append has already resumed, let the writer finish first,
+    // so that it does not touch the fake network concurrently.
+    if (append_resumed) {
+        writer.join();
+    }
+
+    // Deliver the dummy append_entries request (sent by
+    // `yield_leadership`) to S2. S1 resigns once S2 has all of S1's
+    // log entries.
+    s1.fNet->execReqResp();
+    if (writer.joinable()) writer.join();
+    // If S1 sent the new commit index first, it resigns on the
+    // response of that request.
+    s1.fNet->execReqResp();
+    CHK_FALSE( s1.raftServer->is_leader() );
+
+    // Now S2 should receive takeover request.
+    s1.fNet->execReqResp();
+
+    // Send vote request. S1 should grant it, as S2 has the same log.
+    s2.fNet->execReqResp();
+    CHK_TRUE( s2.raftServer->is_leader() );
+
+    // Send new config as a new leader.
+    s2.fNet->execReqResp();
+    // Follow-up: commit.
+    s2.fNet->execReqResp();
+    // Wait for bg commit for configuration change.
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // The log entry appended in flight is not lost.
+    CHK_GT( s1.getTestSm()->isCommitted(test_msg), 0 );
+    CHK_GT( s2.getTestSm()->isCommitted(test_msg), 0 );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int temporary_leader_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -1022,6 +1186,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "leadership takeover with offline candidate test",
                leadership_takeover_offline_candidate_test );
+
+    ts.doTest( "leadership takeover with append in flight test",
+               leadership_takeover_with_append_in_flight_test );
 
     ts.doTest( "temporary leader test",
                temporary_leader_test );
