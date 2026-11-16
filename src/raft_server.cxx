@@ -1284,7 +1284,8 @@ bool raft_server::check_leadership_validity() {
              get_leadership_expiry(),
              min_quorum_size);
 
-        const auto nr_peers_list = get_not_responding_peers();
+        const auto nr_peers_list =
+            get_not_responding_peers((uint64_t)leadership_expiry);
 
         // NOTE:
         //   `nr_peers` and `nr_peers_list.size()` may not be the same,

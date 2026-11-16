@@ -24,6 +24,9 @@ limitations under the License.
 #include "raft_params.hxx"
 #include "test_common.h"
 
+#include <mutex>
+#include <set>
+
 #include <stdio.h>
 
 using namespace nuraft;
@@ -2187,6 +2190,80 @@ int extended_append_entries_api_test() {
     return 0;
 }
 
+int leadership_expiry_follower_lost_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    // Peers reported by `FollowerLost`, as (leader id, peer id).
+    std::mutex lost_lock;
+    std::set< std::pair<int32, int32> > lost_peers;
+    auto cb = [&](cb_func::Type type, cb_func::Param* param) {
+        if (type == cb_func::Type::FollowerLost && param) {
+            std::lock_guard<std::mutex> l(lost_lock);
+            lost_peers.insert( std::make_pair(param->myId, param->peerId) );
+        }
+        return cb_default(type, param);
+    };
+
+    CHK_Z( launch_servers( pkgs, nullptr, false, cb ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // Heartbeat 100 ms, leadership expiry 300 ms: shorter than
+    // the 20 heartbeats (2 seconds) after which a peer is
+    // considered not responding by default.
+    const int32 HB_MS = 100;
+    const int32 EXPIRY_MS = 3 * HB_MS;
+    for (auto& entry: pkgs) {
+        RaftPkg* pp = entry;
+        raft_params param = pp->raftServer->get_current_params();
+        param.heart_beat_interval_ = HB_MS;
+        param.leadership_expiry_ = EXPIRY_MS;
+        pp->raftServer->update_params(param);
+    }
+    CHK_TRUE( s1.raftServer->is_leader() );
+    {
+        std::lock_guard<std::mutex> l(lost_lock);
+        CHK_TRUE( lost_peers.empty() );
+    }
+
+    // S2 and S3 don't respond for longer than the leadership expiry,
+    // but not as long as 20 heartbeats.
+    TestSuite::sleep_ms(2 * EXPIRY_MS);
+
+    // The heartbeat makes S1 check its leadership: a quorum
+    // is not responding, so S1 should report both followers
+    // as lost and yield its leadership.
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+
+    {
+        std::lock_guard<std::mutex> l(lost_lock);
+        std::set< std::pair<int32, int32> > expected =
+            { std::make_pair(1, 2), std::make_pair(1, 3) };
+        CHK_EQ( expected.size(), lost_peers.size() );
+        CHK_TRUE( lost_peers == expected );
+    }
+    CHK_FALSE( s1.raftServer->is_leader() );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 }  // namespace raft_server_test;
 using namespace raft_server_test;
 
@@ -2266,6 +2343,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "extended append_entries API test",
                extended_append_entries_api_test );
+
+    ts.doTest( "leadership expiry follower lost test",
+               leadership_expiry_follower_lost_test );
 
 #ifdef ENABLE_RAFT_STATS
     _msg("raft stats: ENABLED\n");
