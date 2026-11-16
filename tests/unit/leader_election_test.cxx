@@ -859,6 +859,76 @@ int leadership_takeover_offline_candidate_test() {
     return 0;
 }
 
+int leadership_takeover_after_rpc_error_test() {
+    reset_log_files();
+    ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
+
+    std::string s1_addr = "S1";
+    std::string s2_addr = "S2";
+    std::string s3_addr = "S3";
+
+    RaftPkg s1(f_base, 1, s1_addr);
+    RaftPkg s2(f_base, 2, s2_addr);
+    RaftPkg s3(f_base, 3, s3_addr);
+    std::vector<RaftPkg*> pkgs = {&s1, &s2, &s3};
+
+    CHK_Z( launch_servers( pkgs ) );
+    CHK_Z( make_group( pkgs ) );
+
+    // S2 sends a request to S1 (leadership request), and it fails.
+    // As a result, S2's RPC client to S1 is dropped, and S2 will not
+    // re-create it while it is a follower.
+    s2.dbgLog(" --- request leadership, and make it fail ---");
+    CHK_TRUE( s2.raftServer->request_leadership() );
+    CHK_EQ( 1, s2.fNet->getNumPendingReqs(s1_addr) );
+    s2.fNet->makeReqFail(s1_addr);
+    CHK_TRUE( s1.raftServer->is_leader() );
+
+    // Yield leadership to S2.
+    s1.dbgLog(" --- yield leadership ---");
+    s1.raftServer->yield_leadership(false, 2);
+    // Send heartbeat.
+    s1.fTimer->invoke( timer_task_type::heartbeat_timer );
+    s1.fNet->execReqResp();
+    // After getting response of heartbeat, S1 will resign.
+    s1.fNet->execReqResp();
+    CHK_FALSE( s1.raftServer->is_leader() );
+
+    // Now S2 should have received takeover request, and initiated
+    // a forced vote. The vote request to S1 should have been sent
+    // through a new RPC client, instead of being dropped.
+    CHK_EQ( 1, s2.fNet->getNumPendingReqs(s1_addr) );
+
+    // S1's vote alone makes the quorum.
+    s2.fNet->execReqResp(s1_addr);
+    CHK_TRUE( s2.raftServer->is_leader() );
+
+    // Remaining vote request to S3.
+    s2.fNet->execReqResp();
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    // Send new config as a new leader.
+    s2.fNet->execReqResp();
+    // Follow-up: commit.
+    s2.fNet->execReqResp();
+    // Wait for bg commit for configuration change.
+    CHK_Z( wait_for_sm_exec(pkgs, COMMIT_TIMEOUT_SEC) );
+
+    CHK_FALSE( s1.raftServer->is_leader() );
+    CHK_TRUE( s2.raftServer->is_leader() );
+    CHK_FALSE( s3.raftServer->is_leader() );
+
+    print_stats(pkgs);
+
+    s1.raftServer->shutdown();
+    s2.raftServer->shutdown();
+    s3.raftServer->shutdown();
+
+    f_base->destroy();
+
+    return 0;
+}
+
 int temporary_leader_test() {
     reset_log_files();
     ptr<FakeNetworkBase> f_base = cs_new<FakeNetworkBase>();
@@ -1022,6 +1092,9 @@ int main(int argc, char** argv) {
 
     ts.doTest( "leadership takeover with offline candidate test",
                leadership_takeover_offline_candidate_test );
+
+    ts.doTest( "leadership takeover after RPC error test",
+               leadership_takeover_after_rpc_error_test );
 
     ts.doTest( "temporary leader test",
                temporary_leader_test );

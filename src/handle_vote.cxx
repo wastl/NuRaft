@@ -281,6 +281,16 @@ void raft_server::request_vote(bool force_vote) {
             // Do not send voting request to learner or new joiner.
             continue;
         }
+        if (force_vote && pp->need_to_reconnect()) {
+            // A forced vote (leadership takeover) does not go through
+            // `request_prevote()`, which is the only place a non-leader
+            // re-creates RPC clients. If the client to this peer has been
+            // dropped by an earlier RPC error, `send_req()` would discard
+            // the vote request silently, and the takeover would fail.
+            p_in("reset RPC client for peer %d before forced vote",
+                 pp->get_id());
+            reconnect_client(*pp);
+        }
         ptr<req_msg> req = cs_new<req_msg>
                            ( state_->get_term(),
                              msg_type::request_vote_request,
